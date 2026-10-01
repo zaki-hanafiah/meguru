@@ -55,7 +55,7 @@ local Updater = {}
 -- Configuration
 -- ---------------------------------------------------------------------------
 
-local GITHUB_OWNER = "Craftwork2720"
+local GITHUB_OWNER = "zaki-hanafiah"
 local GITHUB_REPO = "meguru"
 
 --- The name of the zip attached to every GitHub Release, and the name this
