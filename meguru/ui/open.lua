@@ -2373,7 +2373,13 @@ function Open.openAsBook(browser, item, stream)
 
                 -- Prefer the built-in plugin's own open path: it closes the
                 -- browser cleanly and hands the marker to ReaderUI.
-                if manager and type(manager.openDownloadedFile) == "function"
+                if type(browser._opener) == "function" then
+                    -- An embedding host (`Open.openStream`) that opens books
+                    -- itself and has bookkeeping around the open that
+                    -- `openPrepared` knows nothing about. Armed like the other
+                    -- two for the same reason: the question is already asked.
+                    handOff(file, function() browser._opener(file) end)
+                elseif manager and type(manager.openDownloadedFile) == "function"
                     and manager.opds_browser then
                     -- Not through `handToReader`, so this is the second place the
                     -- one-shot is armed — same reason and same instant: the dialog
@@ -2391,6 +2397,105 @@ function Open.openAsBook(browser, item, stream)
                 -- opened carries everything that walk would have needed.
             end,
         })
+end
+
+--- Bumped when `Open.openStream`'s argument table changes shape, so an embedding
+--- plugin can tell "no such entry point" from "a different one".
+Open.STREAM_API = 1
+
+--- Open a streamable catalog entry as a book, for a host that is **not** the
+--- built-in OPDS browser — another plugin with its own catalogue UI.
+---
+--- `openAsBook` wants a `browser`: it reads the catalog's title, the credentials
+--- the user typed, the pages it navigated, and the feed the parse hook retained.
+--- A host with its own browser has none of those by construction, so this builds
+--- the same facts from what it *can* hand over and calls `openAsBook` unchanged.
+--- Nothing downstream is duplicated — the same identity, marker and resume
+--- logic runs, and a book opened this way is indistinguishable from one opened
+--- through the built-in browser's "Meguru this series" row.
+---
+--- `args`:
+---   * `server_name` — the catalog's title **as it is in settings/opds.lua**.
+---     Required: `Sources.connection` finds the root URL and credentials by it,
+---     and a title that is not there leaves the book uncatalogued.
+---   * `feed_url`    — the URL `catalog` was fetched from. Required.
+---   * `catalog`     — the **raw parsed Atom** of that feed, the shape OPDSParser
+---     returns (`{ feed = { entry = … } }`). Required, and it has to be the whole
+---     feed rather than one entry: the drivers read siblings, the feed title and
+---     the feed's own links.
+---   * `entry_id`    — the entry's Atom `<id>`; and/or
+---   * `stream_href` — its absolute stream template. One of them is required.
+---     `entry_id` is tried first because it survives a host that resolves
+---     relative links differently from this module; the template is the
+---     fallback.
+---   * `username`, `password` — for the catalog; both optional.
+---   * `opener`      — `function(marker_path)` that opens the written marker. Optional;
+---     without it the file-manager host this plugin was loaded into does.
+---
+--- Returns true when a dialog or a reader was started, nil and a reason when
+--- nothing was. Never throws: the caller is another plugin's tap handler.
+function Open.openStream(args)
+    if type(args) ~= "table" then
+        return nil, "no arguments"
+    end
+    if type(args.server_name) ~= "string" or args.server_name == "" then
+        return nil, "no server_name"
+    end
+    if type(args.feed_url) ~= "string" or args.feed_url == "" then
+        return nil, "no feed_url"
+    end
+    local feed = Net.feedFrom(args.catalog)
+    if type(feed) ~= "table" or type(feed.entry) ~= "table" then
+        return nil, "no feed"
+    end
+
+    -- The retained entry, which is also what proves the stream still exists in
+    -- the feed the host just fetched: a series that lost the volume between the
+    -- host's cached listing and this tap answers nil here and nothing is opened.
+    local entry, template, count, last_read
+    for pass = 1, 2 do
+        for _, candidate in ipairs(feed.entry) do
+            if type(candidate) == "table" then
+                local t, c, lr = PSE.streamFromEntry(candidate, args.feed_url)
+                if t and ((pass == 1 and args.entry_id ~= nil
+                        and candidate.id == args.entry_id)
+                    or (pass == 2 and args.stream_href ~= nil
+                        and t == args.stream_href)) then
+                    entry, template, count, last_read = candidate, t, c, lr
+                    break
+                end
+            end
+        end
+        if entry then
+            break
+        end
+    end
+    if not entry then
+        logger.info("Meguru: openStream found no stream entry",
+            "(entry_id=" .. tostring(args.entry_id) .. ")")
+        return nil, "no stream entry"
+    end
+
+    local browser = {
+        root_catalog_title    = args.server_name,
+        root_catalog_username = args.username,
+        root_catalog_password = args.password,
+        -- `langFromBrowser` reads the navigated URLs for a `lang=` parameter.
+        paths                 = { { url = args.feed_url } },
+        _opener               = args.opener,
+    }
+    local ok, err = pcall(function()
+        Open.noteFeed(browser, args.feed_url, args.catalog)
+        Open.noteCatalogAuthor(browser, args.catalog)
+        Open.openAsBook(browser,
+            { title = type(entry.title) == "string" and entry.title or nil },
+            { href = template, count = count, last_read = last_read })
+    end)
+    if not ok then
+        logger.warn("Meguru: openStream failed:", err)
+        return nil, tostring(err)
+    end
+    return true
 end
 
 --- Add the "Meguru this series" row to the dialog the built-in browser just
